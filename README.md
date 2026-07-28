@@ -11,27 +11,25 @@ A skill-based matchmaking backend built with FastAPI. The service balances match
 - Durable per-player match delivery and acknowledgement
 - Automatic match cleanup after final acknowledgement
 - Shared Redis-backed threshold and system-wide counters
-- Prometheus API instrumentation and a provisioned Grafana dashboard
+- Prometheus instrumentation and a provisioned Grafana dashboard
+- Reproducible Locust load tests with CSV, HTML, and JSON results
 - In-memory backends for local development and deterministic tests
-- Docker Compose development and observability stack
 
 ## Architecture
 
 ```text
-Clients
-   |
+Clients / Locust
+       |
 FastAPI instances / matchmaking workers
-   |
+       |
 Shared Redis queue, inboxes, threshold, and counters
-   |
+       |
 Prometheus  <---- /prometheus
-   |
+       |
 Grafana dashboard
 ```
 
-The engine accepts queue, delivery, and state backends through small interfaces. Redis stores waiting players, durable match inboxes, the adaptive threshold, and system-wide counters. Lua scripts make player claiming, match publication, threshold adaptation, acknowledgement, and cleanup atomic.
-
-Prometheus scrapes each API process for HTTP request metrics and reads shared matchmaking state at scrape time. This keeps queue depth, total matches, SLA rate, and threshold values consistent with Redis while still reporting process-level API latency and status codes.
+Redis stores waiting players, durable match inboxes, the adaptive threshold, and system-wide counters. Lua scripts make player claiming, match publication, threshold adaptation, acknowledgement, and cleanup atomic.
 
 Key files:
 
@@ -39,8 +37,10 @@ Key files:
 - `src/core/match_store.py` — atomic publication, acknowledgement, and cleanup
 - `src/core/state_store.py` — shared threshold and global counters
 - `src/api/observability.py` — Prometheus collector and HTTP middleware
-- `observability/prometheus.yml` — scrape configuration
-- `observability/grafana/` — provisioned datasource and dashboard
+- `loadtest/locustfile.py` — realistic join, poll, acknowledge, and rejoin workload
+- `loadtest/run_benchmark.sh` — reproducible headless benchmark runner
+- `loadtest/summarize_results.py` — normalized JSON result generator
+- `benchmark/REPORT.md` — evidence-based benchmark report template
 
 ## Run the full stack
 
@@ -65,20 +65,54 @@ password: admin
 
 The **Matchmaking Service Overview** dashboard is provisioned automatically. It includes queue depth, rating threshold, total matches, SLA-forced percentage, match rate, API p95 latency, request rate, and 5xx error rate.
 
-Multiple API processes can safely share Redis state:
+## Run a benchmark
 
-```bash
-REDIS_URL=redis://localhost:6379/0 uvicorn api.app:app --workers 4
-```
-
-## Run without Redis
+Install development dependencies and start the full stack:
 
 ```bash
 pip install -e ".[dev]"
-uvicorn api.app:app --reload
+docker compose up --build
 ```
 
-Without `REDIS_URL`, the service uses in-memory queue, match-store, and state-store implementations.
+Run the default 200-user, two-minute scenario:
+
+```bash
+bash loadtest/run_benchmark.sh
+```
+
+Override the workload through environment variables:
+
+```bash
+USERS=500 SPAWN_RATE=50 RUN_TIME=5m bash loadtest/run_benchmark.sh
+```
+
+The simulated player lifecycle is:
+
+1. Enqueue with a randomized rating.
+2. Poll the player's durable match inbox.
+3. Acknowledge a delivered match.
+4. Rejoin with a new player ID.
+5. Periodically read system metrics.
+
+Generated artifacts are written under `benchmark/results/`:
+
+```text
+*_stats.csv
+*_failures.csv
+*_exceptions.csv
+*.html
+*_summary.json
+```
+
+The JSON summary includes requests per second, failure rate, median latency, average latency, p95, and p99. The Locust run exits unsuccessfully when the aggregate failure rate exceeds `LOADTEST_MAX_FAILURE_RATE`, which defaults to `0.01`.
+
+Example custom guardrail:
+
+```bash
+LOADTEST_MAX_FAILURE_RATE=0.005 USERS=300 RUN_TIME=3m bash loadtest/run_benchmark.sh
+```
+
+Do not claim benchmark numbers until a real run is completed on documented hardware. Copy verified values into `benchmark/REPORT.md` and record the commit, API worker count, CPU, memory, and Redis deployment.
 
 ## Configuration
 
@@ -88,6 +122,9 @@ Without `REDIS_URL`, the service uses in-memory queue, match-store, and state-st
 | `REDIS_NAMESPACE` | `matchmaking` | Prefix for queue, delivery, threshold, and metric keys. |
 | `ENABLE_BACKGROUND_TICK` | `1` | Enables the background matchmaking loop. |
 | `TICK_INTERVAL_SECONDS` | `1.0` | Seconds between matchmaking ticks. |
+| `LOADTEST_RATING_MIN` | `800` | Minimum simulated player rating. |
+| `LOADTEST_RATING_MAX` | `1800` | Maximum simulated player rating. |
+| `LOADTEST_MAX_FAILURE_RATE` | `0.01` | Maximum accepted aggregate request failure ratio. |
 
 ## API
 
@@ -132,36 +169,25 @@ GET /metrics
 GET /prometheus
 ```
 
-Exported series include:
-
-```text
-matchmaking_queue_depth
-matchmaking_total_enqueues
-matchmaking_total_matches
-matchmaking_sla_forced_matches
-matchmaking_sla_forced_percentage
-matchmaking_current_threshold
-matchmaking_http_requests_total
-matchmaking_http_request_duration_seconds
-```
-
 ## Tests
 
 ```bash
 pytest -q
 ```
 
-Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers multi-worker atomicity, durable delivery, shared threshold state, cleanup, fresh scrape-time collection, and HTTP instrumentation.
+The suite covers multi-worker atomicity, durable delivery, shared threshold state, cleanup, Prometheus collection, HTTP instrumentation, and benchmark-result parsing.
 
 ## Current limitations
 
 - Match records are removed after delivery, so long-term history requires a separate database.
 - HTTP metrics are process-local when running multiple Uvicorn workers; Prometheus aggregates them across scrape targets.
+- Published benchmark numbers still require a real run on documented hardware.
 - The adaptive controller still needs tuning with realistic production load data.
 
 ## Next improvements
 
-- Add load testing and publish benchmark results
+- Execute and publish benchmark results from controlled hardware
 - Add PostgreSQL-backed long-term match history
 - Add alerting rules for queue growth, latency, and SLA degradation
 - Add authentication and rate limiting
+- Add GitHub Actions CI for tests and benchmark smoke checks
