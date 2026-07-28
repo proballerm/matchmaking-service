@@ -8,13 +8,21 @@ from redis import Redis
 from core.models import QueueEntry
 
 
-class RedisMatchmakingQueue:
-    """Redis-backed matchmaking queue shared across service instances.
+CLAIM_PLAYERS_SCRIPT = """
+for index = 1, #ARGV do
+    if redis.call('ZSCORE', KEYS[1], ARGV[index]) == false then
+        return 0
+    end
+end
 
-    A sorted set stores players by join time and a hash stores each player's
-    rating. Queue mutations use Redis pipelines so related updates are applied
-    together.
-    """
+redis.call('ZREM', KEYS[1], unpack(ARGV))
+redis.call('HDEL', KEYS[2], unpack(ARGV))
+return 1
+"""
+
+
+class RedisMatchmakingQueue:
+    """Redis-backed queue shared safely across API and worker processes."""
 
     def __init__(self, client: Redis, namespace: str = "matchmaking") -> None:
         self.client = client
@@ -31,9 +39,7 @@ class RedisMatchmakingQueue:
         if join_time.tzinfo is None:
             raise ValueError("join_time must be timezone-aware UTC")
 
-        join_time = join_time.astimezone(timezone.utc)
-        score = join_time.timestamp()
-
+        score = join_time.astimezone(timezone.utc).timestamp()
         with self.client.pipeline(transaction=True) as pipe:
             pipe.zadd(self.queue_key, {player_id: score}, nx=True)
             pipe.hsetnx(self.ratings_key, player_id, str(float(rating)))
@@ -43,7 +49,7 @@ class RedisMatchmakingQueue:
             raise ValueError(f"player already queued: {player_id}")
 
     def remove_players(self, player_ids: Iterable[str]) -> None:
-        ids = list(player_ids)
+        ids = list(dict.fromkeys(player_ids))
         if not ids:
             return
 
@@ -51,6 +57,26 @@ class RedisMatchmakingQueue:
             pipe.zrem(self.queue_key, *ids)
             pipe.hdel(self.ratings_key, *ids)
             pipe.execute()
+
+    def claim_players(self, player_ids: Iterable[str]) -> bool:
+        """Atomically claim players for exactly one matchmaking worker.
+
+        Redis executes the Lua script as one indivisible operation. The claim
+        succeeds only when every requested player is still present; otherwise
+        no player is removed.
+        """
+        ids = list(dict.fromkeys(player_ids))
+        if not ids:
+            return False
+
+        claimed = self.client.eval(
+            CLAIM_PLAYERS_SCRIPT,
+            2,
+            self.queue_key,
+            self.ratings_key,
+            *ids,
+        )
+        return bool(claimed)
 
     def get_entries(self) -> List[QueueEntry]:
         queued = self.client.zrange(self.queue_key, 0, -1, withscores=True)
