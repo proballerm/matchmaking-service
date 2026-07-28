@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Protocol
+from typing import Callable, List, Optional, Protocol
 
 from core.models import Match, QueueEntry
 
@@ -9,6 +9,9 @@ from core.models import Match, QueueEntry
 class ClaimableQueue(Protocol):
     def get_entries(self) -> List[QueueEntry]: ...
     def claim_players(self, player_ids: List[str]) -> bool: ...
+
+
+ClaimMatch = Callable[[List[str], float], bool]
 
 
 class Matchmaker:
@@ -39,10 +42,17 @@ class Matchmaker:
             min(self.max_threshold, self.current_threshold),
         )
 
-    def try_form_matches(self, queue: ClaimableQueue) -> List[Match]:
+    def try_form_matches(
+        self,
+        queue: ClaimableQueue,
+        claim_match: Optional[ClaimMatch] = None,
+    ) -> List[Match]:
         entries = sorted(queue.get_entries(), key=lambda entry: entry.join_time)
         matches: List[Match] = []
         unavailable_players = set()
+        claim = claim_match or (
+            lambda player_ids, _rating_diff: queue.claim_players(player_ids)
+        )
 
         for index, player_a in enumerate(entries):
             if player_a.player_id in unavailable_players:
@@ -51,28 +61,37 @@ class Matchmaker:
             for player_b in entries[index + 1 :]:
                 if player_b.player_id in unavailable_players:
                     continue
-                if abs(player_a.rating - player_b.rating) > self.current_threshold:
+
+                rating_diff = abs(player_a.rating - player_b.rating)
+                if rating_diff > self.current_threshold:
                     continue
 
                 player_ids = [player_a.player_id, player_b.player_id]
-                if queue.claim_players(player_ids):
+                if claim(player_ids, rating_diff):
                     matches.append(Match.create(player_ids))
                     unavailable_players.update(player_ids)
                     break
 
-                # Another worker claimed at least one member of this pair.
                 unavailable_players.update(player_ids)
                 break
 
         return matches
 
-    def enforce_sla(self, queue: ClaimableQueue, now: datetime) -> List[Match]:
+    def enforce_sla(
+        self,
+        queue: ClaimableQueue,
+        now: datetime,
+        claim_match: Optional[ClaimMatch] = None,
+    ) -> List[Match]:
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         else:
             now = now.astimezone(timezone.utc)
 
         matches: List[Match] = []
+        claim = claim_match or (
+            lambda player_ids, _rating_diff: queue.claim_players(player_ids)
+        )
 
         while True:
             entries = sorted(queue.get_entries(), key=lambda entry: entry.join_time)
@@ -91,13 +110,13 @@ class Matchmaker:
             claimed = False
             for partner in partners:
                 player_ids = [oldest.player_id, partner.player_id]
-                if queue.claim_players(player_ids):
+                rating_diff = abs(oldest.rating - partner.rating)
+                if claim(player_ids, rating_diff):
                     matches.append(Match.create(player_ids))
                     claimed = True
                     break
 
             if not claimed:
-                # The queue changed under this worker. Refresh before deciding.
                 continue
 
         return matches
