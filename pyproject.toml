@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matchmaking-service"
-version = "0.7.0"
+version = "0.8.0"
 description = "Skill-based matchmaking service"
 dependencies = [
   "fastapi",
   "uvicorn",
   "pydantic",
   "redis>=5.0,<7.0",
+  "prometheus-client>=0.20,<1.0",
 ]
 
 [project.optional-dependencies]
