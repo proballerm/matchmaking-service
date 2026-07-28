@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matchmaking-service"
-version = "0.8.0"
+version = "0.9.0"
 description = "Skill-based matchmaking service"
 dependencies = [
   "fastapi",
@@ -19,6 +19,7 @@ dev = [
   "pytest",
   "httpx",
   "fakeredis[lua]>=2.23,<3.0",
+  "locust>=2.29,<3.0",
 ]
 
 [tool.setuptools]
