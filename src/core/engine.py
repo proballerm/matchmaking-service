@@ -8,6 +8,7 @@ from core.match_store import InMemoryMatchStore, MatchStore
 from core.matcher import Matchmaker
 from core.models import MatchRecord, Player, QueueEntry
 from core.queue import MatchmakingQueue
+from core.state_store import InMemoryStateStore, StateStore
 
 
 class QueueBackend(Protocol):
@@ -27,20 +28,24 @@ class MatchmakingEngine:
         now_fn: Optional[Callable[[], datetime]] = None,
         queue: Optional[QueueBackend] = None,
         match_store: Optional[MatchStore] = None,
+        state_store: Optional[StateStore] = None,
     ):
         self.queue: QueueBackend = queue or MatchmakingQueue()
         self.match_store: MatchStore = match_store or InMemoryMatchStore()
         self.matchmaker = matchmaker or Matchmaker()
+        self.state_store: StateStore = state_store or InMemoryStateStore(
+            base_threshold=self.matchmaker.base_threshold,
+            min_threshold=self.matchmaker.min_threshold,
+            max_threshold=self.matchmaker.max_threshold,
+            target_avg_wait=self.matchmaker.target_avg_wait,
+            adapt_rate=self.matchmaker.adapt_rate,
+        )
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
         self.players: Dict[str, Player] = {}
         self.join_times: Dict[str, datetime] = {}
         self._sync_waiting_players()
         self.created_matches: List[MatchRecord] = []
-
-        self.total_enqueues = 0
-        self.total_matches = 0
-        self.sla_forced_matches = 0
 
     def _sync_waiting_players(self) -> None:
         entries = self.queue.get_entries()
@@ -66,7 +71,7 @@ class MatchmakingEngine:
 
         self.players[player_id] = Player(player_id, rating, now)
         self.join_times[player_id] = now
-        self.total_enqueues += 1
+        self.state_store.increment("total_enqueues")
         return True
 
     def dequeue_player(self, player_id: str) -> bool:
@@ -82,6 +87,7 @@ class MatchmakingEngine:
     def run_matchmaking_once(self, now: Optional[datetime] = None) -> List[MatchRecord]:
         now = now or self._now_fn()
         self._sync_waiting_players()
+        self.matchmaker.current_threshold = self.state_store.get_threshold()
         new_records: List[MatchRecord] = []
         normal_waits: List[float] = []
 
@@ -110,7 +116,9 @@ class MatchmakingEngine:
         )
 
         if normal_matches and normal_waits:
-            self.matchmaker.adapt_threshold(sum(normal_waits) / len(normal_waits))
+            self.matchmaker.current_threshold = self.state_store.adapt_threshold(
+                sum(normal_waits) / len(normal_waits)
+            )
 
         def claim_sla(player_ids: List[str], rating_diff: float) -> bool:
             record = self._build_match_record(
@@ -131,9 +139,12 @@ class MatchmakingEngine:
             claim_match=claim_sla,
         )
 
-        self.sla_forced_matches += len(sla_matches)
+        if new_records:
+            self.state_store.increment("total_matches", len(new_records))
+        if sla_matches:
+            self.state_store.increment("sla_forced_matches", len(sla_matches))
+
         self.created_matches.extend(new_records)
-        self.total_matches += len(new_records)
         return new_records
 
     def get_pending_matches(self, player_id: str) -> List[MatchRecord]:
@@ -148,16 +159,17 @@ class MatchmakingEngine:
         return out
 
     def get_metrics(self) -> Dict[str, float]:
-        queue_depth = self.queue.size()
-        sla_pct = (self.sla_forced_matches / self.total_matches) * 100 if self.total_matches else 0.0
-        return {
-            "queue_depth": float(queue_depth),
-            "total_enqueues": float(self.total_enqueues),
-            "total_matches": float(self.total_matches),
-            "sla_forced_matches": float(self.sla_forced_matches),
-            "sla_forced_percentage": float(sla_pct),
-            "current_threshold": float(self.matchmaker.current_threshold),
-        }
+        metrics = self.state_store.get_metrics()
+        total_matches = metrics["total_matches"]
+        sla_matches = metrics["sla_forced_matches"]
+        metrics.update(
+            {
+                "queue_depth": float(self.queue.size()),
+                "sla_forced_percentage": (sla_matches / total_matches) * 100 if total_matches else 0.0,
+                "current_threshold": float(self.state_store.get_threshold()),
+            }
+        )
+        return metrics
 
     def _build_match_record(
         self,
