@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from core.match_store import InMemoryMatchStore, MatchStore
 from core.matcher import Matchmaker
-from core.models import Match, MatchRecord, Player, QueueEntry
+from core.models import MatchRecord, Player, QueueEntry
 from core.queue import MatchmakingQueue
 
 
@@ -86,8 +86,23 @@ class MatchmakingEngine:
         self._sync_waiting_players()
         new_records: List[MatchRecord] = []
 
-        normal_matches = self.matchmaker.try_form_matches(self.queue)
-        sla_matches = self.matchmaker.enforce_sla(self.queue, now)
+        def claim_normal(player_ids: List[str], rating_diff: float) -> bool:
+            record = self._build_match_record(
+                player_ids,
+                now,
+                rating_diff,
+                sla_forced=False,
+            )
+            if not self.match_store.claim_and_publish(self.queue, record):
+                return False
+            new_records.append(record)
+            self._remove_local_players(player_ids)
+            return True
+
+        normal_matches = self.matchmaker.try_form_matches(
+            self.queue,
+            claim_match=claim_normal,
+        )
 
         if normal_matches:
             waits: List[float] = []
@@ -100,17 +115,26 @@ class MatchmakingEngine:
             if waits:
                 self.matchmaker.adapt_threshold(sum(waits) / len(waits))
 
+        def claim_sla(player_ids: List[str], rating_diff: float) -> bool:
+            record = self._build_match_record(
+                player_ids,
+                now,
+                rating_diff,
+                sla_forced=True,
+            )
+            if not self.match_store.claim_and_publish(self.queue, record):
+                return False
+            new_records.append(record)
+            self._remove_local_players(player_ids)
+            return True
+
+        sla_matches = self.matchmaker.enforce_sla(
+            self.queue,
+            now,
+            claim_match=claim_sla,
+        )
+
         self.sla_forced_matches += len(sla_matches)
-
-        for match in normal_matches:
-            new_records.append(self._record_match(match, now, sla_forced=False))
-
-        for match in sla_matches:
-            new_records.append(self._record_match(match, now, sla_forced=True))
-
-        for record in new_records:
-            self.match_store.publish(record)
-
         self.created_matches.extend(new_records)
         self.total_matches += len(new_records)
         return new_records
@@ -140,21 +164,23 @@ class MatchmakingEngine:
             "current_threshold": float(self.matchmaker.current_threshold),
         }
 
-    def _record_match(self, match: Match, now: datetime, sla_forced: bool) -> MatchRecord:
-        player_a_id, player_b_id = match.player_ids
-        player_a = self.players[player_a_id]
-        player_b = self.players[player_b_id]
-
-        record = MatchRecord(
+    def _build_match_record(
+        self,
+        player_ids: List[str],
+        now: datetime,
+        rating_diff: float,
+        sla_forced: bool,
+    ) -> MatchRecord:
+        return MatchRecord(
             match_id=str(uuid4()),
-            player_ids=(player_a_id, player_b_id),
+            player_ids=(player_ids[0], player_ids[1]),
             created_at=now,
-            rating_diff=abs(player_a.rating - player_b.rating),
+            rating_diff=rating_diff,
             sla_forced=sla_forced,
             threshold_at_match=float(self.matchmaker.current_threshold),
         )
-        self.players.pop(player_a_id, None)
-        self.players.pop(player_b_id, None)
-        self.join_times.pop(player_a_id, None)
-        self.join_times.pop(player_b_id, None)
-        return record
+
+    def _remove_local_players(self, player_ids: Iterable[str]) -> None:
+        for player_id in player_ids:
+            self.players.pop(player_id, None)
+            self.join_times.pop(player_id, None)
