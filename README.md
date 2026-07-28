@@ -10,10 +10,10 @@ A skill-based matchmaking backend built with FastAPI. The service balances match
 - Atomic Redis match commits that prevent duplicate or lost matches across workers
 - Durable per-player match inboxes with explicit acknowledgement
 - Automatic match payload cleanup after all participants acknowledge delivery
+- Shared Redis-backed adaptive threshold and system-wide metrics
 - In-memory fallback for local development and deterministic tests
 - Continuous background matchmaking loop
 - Docker and Docker Compose support
-- Metrics for queue depth, match count, threshold state, and SLA-forced matches
 
 ## Architecture
 
@@ -22,33 +22,26 @@ Clients
    |
 FastAPI instances / matchmaking workers
    |
-Shared Redis queue + durable player inboxes
+Shared Redis queue, match inboxes, threshold, and counters
    |
-Atomic Lua claim, publish, acknowledge, and cleanup operations
+Atomic Lua state transitions
 ```
 
-The engine is independent of FastAPI and accepts queue and match-store backends through small interfaces.
+The engine is independent of FastAPI and accepts queue, match-store, and state-store backends through small interfaces.
 
-- `src/core/engine.py` — orchestration, worker synchronization, match creation, and delivery
+- `src/core/engine.py` — orchestration, worker synchronization, match creation, delivery, and metrics
 - `src/core/matcher.py` — threshold matching and SLA candidate selection
 - `src/core/queue.py` — in-memory queue implementing the same claim contract
 - `src/core/redis_queue.py` — Redis sorted-set and rating-hash queue
-- `src/core/match_store.py` — in-memory delivery plus atomic Redis publication and cleanup
+- `src/core/match_store.py` — atomic Redis publication, acknowledgement, and cleanup
+- `src/core/state_store.py` — shared adaptive threshold and global counters
 - `src/api/app.py` — HTTP API and background worker
 
-Redis stores waiting players in a sorted set scored by UTC join timestamp and stores ratings in a hash. Workers identify candidate pairs independently. For each candidate, the engine builds the complete match record before attempting the commit.
+Redis stores waiting players, durable match inboxes, the current adaptive threshold, and system-wide counters. Every worker refreshes the shared threshold before a matchmaking tick. Threshold adaptations use a Lua script, so concurrent workers update the same value atomically rather than overwriting one another.
 
-A Redis Lua script then performs all of the following as one indivisible operation:
+The shared counters track successful enqueues, completed matches, and SLA-forced matches. Therefore every API instance returns the same totals from `/metrics`, and those values survive individual worker restarts.
 
-1. Confirms both players are still queued.
-2. Removes both players and their rating metadata.
-3. Stores the serialized match record.
-4. Stores the number of required acknowledgements.
-5. Adds the match ID to each player's inbox.
-
-If either player was already claimed, the script returns failure and writes nothing. This removes the crash window where a worker could remove players and fail before publishing their match.
-
-Acknowledgements are also processed atomically. Redis removes the match only from the acknowledging player's inbox and decrements the remaining acknowledgement count. When the final participant acknowledges, Redis deletes both the stored match payload and its acknowledgement counter. Duplicate or invalid acknowledgements do not decrement the count.
+Match creation and delivery remain atomic. A Lua script confirms both players are queued, removes them, stores the serialized match, initializes its acknowledgement count, and adds it to both inboxes as one operation. Final acknowledgement removes the retained payload automatically.
 
 ## Run with Redis
 
@@ -62,7 +55,7 @@ Then open:
 - Health endpoint: `http://localhost:8000/health`
 - Metrics: `http://localhost:8000/metrics`
 
-Multiple processes can share the same Redis state:
+Multiple processes can safely share the same state:
 
 ```bash
 REDIS_URL=redis://localhost:6379/0 uvicorn api.app:app --workers 4
@@ -75,14 +68,14 @@ pip install -e ".[dev]"
 uvicorn api.app:app --reload
 ```
 
-Without `REDIS_URL`, the service uses in-memory queue and match-store implementations.
+Without `REDIS_URL`, the service uses in-memory queue, match-store, and state-store implementations.
 
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `REDIS_URL` | unset | Redis connection URL. When unset, the service uses memory. |
-| `REDIS_NAMESPACE` | `matchmaking` | Prefix for Redis queue and match-delivery keys. |
+| `REDIS_NAMESPACE` | `matchmaking` | Prefix for queue, delivery, threshold, and metric keys. |
 | `ENABLE_BACKGROUND_TICK` | `1` | Enables the background matchmaking loop. |
 | `TICK_INTERVAL_SECONDS` | `1.0` | Seconds between matchmaking ticks. |
 
@@ -128,15 +121,7 @@ Content-Type: application/json
 }
 ```
 
-Acknowledgement removes the match only from that player's pending inbox. The other participant acknowledges independently. After the final acknowledgement, the shared match payload is deleted automatically.
-
-### Legacy global match feed
-
-```http
-GET /matches
-```
-
-This endpoint is process-local and retained only for backward compatibility. New clients should use the player-specific endpoints.
+Acknowledgement removes the match only from that player's pending inbox. After the final acknowledgement, the shared match payload is deleted automatically.
 
 ### Trigger one matchmaking tick
 
@@ -147,10 +132,23 @@ Content-Type: application/json
 {}
 ```
 
-### Read metrics
+### Read system-wide metrics
 
 ```http
 GET /metrics
+```
+
+Example fields:
+
+```json
+{
+  "queue_depth": 12.0,
+  "total_enqueues": 1000.0,
+  "total_matches": 480.0,
+  "sla_forced_matches": 12.0,
+  "sla_forced_percentage": 2.5,
+  "current_threshold": 135.0
+}
 ```
 
 ## Tests
@@ -159,18 +157,17 @@ GET /metrics
 pytest -q
 ```
 
-Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers atomic multi-worker claims, all-or-nothing match commits, failed-claim rollback behavior, persistence, player-scoped acknowledgements, duplicate acknowledgements, and automatic cleanup after final delivery.
+Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers atomic multi-worker claims, all-or-nothing match commits, durable delivery and cleanup, shared counters, and atomic threshold adaptation across worker instances.
 
 ## Current limitations
 
-- Metrics counters are process-local and reset when an API instance restarts.
-- Adaptive threshold state is not yet shared across workers.
 - Match records are removed after delivery, so long-term match history requires a separate durable database.
+- Metrics are available as JSON but are not yet exported in Prometheus format.
+- The adaptive controller is intentionally simple and has not yet been tuned with production load data.
 
 ## Next improvements
 
-- Share threshold and metrics state across workers
 - Add Prometheus metrics and Grafana dashboards
 - Add load testing and benchmark reports
-- Add authentication and rate limiting
 - Add PostgreSQL-backed long-term match history
+- Add authentication and rate limiting
