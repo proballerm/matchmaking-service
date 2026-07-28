@@ -6,14 +6,14 @@ A skill-based matchmaking backend built with FastAPI. The service balances match
 
 - Skill-based matching with adaptive rating thresholds
 - SLA-forced matches for players waiting beyond the configured maximum
-- Redis-backed queue persistence with automatic recovery after API restarts
-- Atomic Redis match commits that prevent duplicate or lost matches across workers
-- Durable per-player match inboxes with explicit acknowledgement
-- Automatic match payload cleanup after all participants acknowledge delivery
-- Shared Redis-backed adaptive threshold and system-wide metrics
-- In-memory fallback for local development and deterministic tests
-- Continuous background matchmaking loop
-- Docker and Docker Compose support
+- Redis-backed queue persistence and restart recovery
+- Atomic Redis match commits across concurrent workers
+- Durable per-player match delivery and acknowledgement
+- Automatic match cleanup after final acknowledgement
+- Shared Redis-backed threshold and system-wide counters
+- Prometheus API instrumentation and a provisioned Grafana dashboard
+- In-memory backends for local development and deterministic tests
+- Docker Compose development and observability stack
 
 ## Architecture
 
@@ -22,40 +22,50 @@ Clients
    |
 FastAPI instances / matchmaking workers
    |
-Shared Redis queue, match inboxes, threshold, and counters
+Shared Redis queue, inboxes, threshold, and counters
    |
-Atomic Lua state transitions
+Prometheus  <---- /prometheus
+   |
+Grafana dashboard
 ```
 
-The engine is independent of FastAPI and accepts queue, match-store, and state-store backends through small interfaces.
+The engine accepts queue, delivery, and state backends through small interfaces. Redis stores waiting players, durable match inboxes, the adaptive threshold, and system-wide counters. Lua scripts make player claiming, match publication, threshold adaptation, acknowledgement, and cleanup atomic.
 
-- `src/core/engine.py` — orchestration, worker synchronization, match creation, delivery, and metrics
-- `src/core/matcher.py` — threshold matching and SLA candidate selection
-- `src/core/queue.py` — in-memory queue implementing the same claim contract
-- `src/core/redis_queue.py` — Redis sorted-set and rating-hash queue
-- `src/core/match_store.py` — atomic Redis publication, acknowledgement, and cleanup
-- `src/core/state_store.py` — shared adaptive threshold and global counters
-- `src/api/app.py` — HTTP API and background worker
+Prometheus scrapes each API process for HTTP request metrics and reads shared matchmaking state at scrape time. This keeps queue depth, total matches, SLA rate, and threshold values consistent with Redis while still reporting process-level API latency and status codes.
 
-Redis stores waiting players, durable match inboxes, the current adaptive threshold, and system-wide counters. Every worker refreshes the shared threshold before a matchmaking tick. Threshold adaptations use a Lua script, so concurrent workers update the same value atomically rather than overwriting one another.
+Key files:
 
-The shared counters track successful enqueues, completed matches, and SLA-forced matches. Therefore every API instance returns the same totals from `/metrics`, and those values survive individual worker restarts.
+- `src/core/engine.py` — orchestration and matchmaking lifecycle
+- `src/core/match_store.py` — atomic publication, acknowledgement, and cleanup
+- `src/core/state_store.py` — shared threshold and global counters
+- `src/api/observability.py` — Prometheus collector and HTTP middleware
+- `observability/prometheus.yml` — scrape configuration
+- `observability/grafana/` — provisioned datasource and dashboard
 
-Match creation and delivery remain atomic. A Lua script confirms both players are queued, removes them, stores the serialized match, initializes its acknowledgement count, and adds it to both inboxes as one operation. Final acknowledgement removes the retained payload automatically.
-
-## Run with Redis
+## Run the full stack
 
 ```bash
 docker compose up --build
 ```
 
-Then open:
+Open:
 
 - API documentation: `http://localhost:8000/docs`
-- Health endpoint: `http://localhost:8000/health`
-- Metrics: `http://localhost:8000/metrics`
+- JSON metrics: `http://localhost:8000/metrics`
+- Prometheus metrics: `http://localhost:8000/prometheus`
+- Prometheus UI: `http://localhost:9090`
+- Grafana: `http://localhost:3000`
 
-Multiple processes can safely share the same state:
+Grafana development credentials:
+
+```text
+username: admin
+password: admin
+```
+
+The **Matchmaking Service Overview** dashboard is provisioned automatically. It includes queue depth, rating threshold, total matches, SLA-forced percentage, match rate, API p95 latency, request rate, and 5xx error rate.
+
+Multiple API processes can safely share Redis state:
 
 ```bash
 REDIS_URL=redis://localhost:6379/0 uvicorn api.app:app --workers 4
@@ -93,24 +103,13 @@ Content-Type: application/json
 }
 ```
 
-### Dequeue a player
-
-```http
-POST /dequeue
-Content-Type: application/json
-
-{
-  "player_id": "p1"
-}
-```
-
-### Poll a player's pending matches
+### Poll pending matches
 
 ```http
 GET /players/p1/matches
 ```
 
-### Acknowledge a delivered match
+### Acknowledge delivery
 
 ```http
 POST /players/p1/matches/ack
@@ -121,34 +120,29 @@ Content-Type: application/json
 }
 ```
 
-Acknowledgement removes the match only from that player's pending inbox. After the final acknowledgement, the shared match payload is deleted automatically.
-
-### Trigger one matchmaking tick
-
-```http
-POST /tick
-Content-Type: application/json
-
-{}
-```
-
-### Read system-wide metrics
+### Read JSON metrics
 
 ```http
 GET /metrics
 ```
 
-Example fields:
+### Scrape Prometheus metrics
 
-```json
-{
-  "queue_depth": 12.0,
-  "total_enqueues": 1000.0,
-  "total_matches": 480.0,
-  "sla_forced_matches": 12.0,
-  "sla_forced_percentage": 2.5,
-  "current_threshold": 135.0
-}
+```http
+GET /prometheus
+```
+
+Exported series include:
+
+```text
+matchmaking_queue_depth
+matchmaking_total_enqueues
+matchmaking_total_matches
+matchmaking_sla_forced_matches
+matchmaking_sla_forced_percentage
+matchmaking_current_threshold
+matchmaking_http_requests_total
+matchmaking_http_request_duration_seconds
 ```
 
 ## Tests
@@ -157,17 +151,17 @@ Example fields:
 pytest -q
 ```
 
-Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers atomic multi-worker claims, all-or-nothing match commits, durable delivery and cleanup, shared counters, and atomic threshold adaptation across worker instances.
+Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers multi-worker atomicity, durable delivery, shared threshold state, cleanup, fresh scrape-time collection, and HTTP instrumentation.
 
 ## Current limitations
 
-- Match records are removed after delivery, so long-term match history requires a separate durable database.
-- Metrics are available as JSON but are not yet exported in Prometheus format.
-- The adaptive controller is intentionally simple and has not yet been tuned with production load data.
+- Match records are removed after delivery, so long-term history requires a separate database.
+- HTTP metrics are process-local when running multiple Uvicorn workers; Prometheus aggregates them across scrape targets.
+- The adaptive controller still needs tuning with realistic production load data.
 
 ## Next improvements
 
-- Add Prometheus metrics and Grafana dashboards
-- Add load testing and benchmark reports
+- Add load testing and publish benchmark results
 - Add PostgreSQL-backed long-term match history
+- Add alerting rules for queue growth, latency, and SLA degradation
 - Add authentication and rate limiting
