@@ -21,8 +21,23 @@ end
 redis.call('ZREM', KEYS[1], ARGV[1], ARGV[2])
 redis.call('HDEL', KEYS[2], ARGV[1], ARGV[2])
 redis.call('HSET', KEYS[3], ARGV[3], ARGV[4])
-redis.call('RPUSH', KEYS[4], ARGV[3])
+redis.call('HSET', KEYS[4], ARGV[3], 2)
 redis.call('RPUSH', KEYS[5], ARGV[3])
+redis.call('RPUSH', KEYS[6], ARGV[3])
+return 1
+"""
+
+ACKNOWLEDGE_AND_CLEANUP_SCRIPT = """
+local removed = redis.call('LREM', KEYS[1], 0, ARGV[1])
+if removed == 0 then
+    return 0
+end
+
+local remaining = redis.call('HINCRBY', KEYS[3], ARGV[1], -1)
+if remaining <= 0 then
+    redis.call('HDEL', KEYS[2], ARGV[1])
+    redis.call('HDEL', KEYS[3], ARGV[1])
+end
 return 1
 """
 
@@ -57,9 +72,11 @@ class InMemoryMatchStore:
     def __init__(self) -> None:
         self._matches: Dict[str, MatchRecord] = {}
         self._inboxes: Dict[str, List[str]] = {}
+        self._remaining_acknowledgements: Dict[str, int] = {}
 
     def publish(self, match: MatchRecord) -> None:
         self._matches[match.match_id] = match
+        self._remaining_acknowledgements[match.match_id] = len(match.player_ids)
         for player_id in match.player_ids:
             self._inboxes.setdefault(player_id, []).append(match.match_id)
 
@@ -81,7 +98,14 @@ class InMemoryMatchStore:
         inbox = self._inboxes.get(player_id, [])
         if match_id not in inbox:
             return False
+
         inbox.remove(match_id)
+        remaining = self._remaining_acknowledgements.get(match_id, 1) - 1
+        if remaining <= 0:
+            self._remaining_acknowledgements.pop(match_id, None)
+            self._matches.pop(match_id, None)
+        else:
+            self._remaining_acknowledgements[match_id] = remaining
         return True
 
 
@@ -91,6 +115,7 @@ class RedisMatchStore:
     def __init__(self, client: Redis, namespace: str = "matchmaking") -> None:
         self.client = client
         self.matches_key = f"{namespace}:matches"
+        self.remaining_acks_key = f"{namespace}:match_remaining_acks"
         self.inbox_prefix = f"{namespace}:player_matches:"
 
     def _inbox_key(self, player_id: str) -> str:
@@ -100,6 +125,7 @@ class RedisMatchStore:
         payload = _serialize(match)
         with self.client.pipeline(transaction=True) as pipe:
             pipe.hset(self.matches_key, match.match_id, payload)
+            pipe.hset(self.remaining_acks_key, match.match_id, len(match.player_ids))
             for player_id in match.player_ids:
                 pipe.rpush(self._inbox_key(player_id), match.match_id)
             pipe.execute()
@@ -118,10 +144,11 @@ class RedisMatchStore:
         player_a, player_b = match.player_ids
         result = self.client.eval(
             ATOMIC_CLAIM_AND_PUBLISH_SCRIPT,
-            5,
+            6,
             queue_key,
             ratings_key,
             self.matches_key,
+            self.remaining_acks_key,
             self._inbox_key(player_a),
             self._inbox_key(player_b),
             player_a,
@@ -154,5 +181,12 @@ class RedisMatchStore:
         return pending
 
     def acknowledge(self, player_id: str, match_id: str) -> bool:
-        removed = self.client.lrem(self._inbox_key(player_id), 0, match_id)
-        return bool(removed)
+        acknowledged = self.client.eval(
+            ACKNOWLEDGE_AND_CLEANUP_SCRIPT,
+            3,
+            self._inbox_key(player_id),
+            self.matches_key,
+            self.remaining_acks_key,
+            match_id,
+        )
+        return bool(acknowledged)
