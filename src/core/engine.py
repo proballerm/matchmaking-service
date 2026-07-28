@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Dict, Iterable, List, Optional, Protocol, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Protocol
 from uuid import uuid4
 
+from core.match_store import InMemoryMatchStore, MatchStore
 from core.matcher import Matchmaker
-from core.models import Match, Player, QueueEntry
+from core.models import Match, MatchRecord, Player, QueueEntry
 from core.queue import MatchmakingQueue
 
 
@@ -18,16 +18,6 @@ class QueueBackend(Protocol):
     def size(self) -> int: ...
 
 
-@dataclass
-class MatchRecord:
-    match_id: str
-    player_ids: Tuple[str, str]
-    created_at: datetime
-    rating_diff: float
-    sla_forced: bool
-    threshold_at_match: float
-
-
 class MatchmakingEngine:
     """Framework-independent matchmaking engine."""
 
@@ -36,8 +26,10 @@ class MatchmakingEngine:
         matchmaker: Optional[Matchmaker] = None,
         now_fn: Optional[Callable[[], datetime]] = None,
         queue: Optional[QueueBackend] = None,
+        match_store: Optional[MatchStore] = None,
     ):
         self.queue: QueueBackend = queue or MatchmakingQueue()
+        self.match_store: MatchStore = match_store or InMemoryMatchStore()
         self.matchmaker = matchmaker or Matchmaker()
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
@@ -116,11 +108,21 @@ class MatchmakingEngine:
         for match in sla_matches:
             new_records.append(self._record_match(match, now, sla_forced=True))
 
+        for record in new_records:
+            self.match_store.publish(record)
+
         self.created_matches.extend(new_records)
         self.total_matches += len(new_records)
         return new_records
 
+    def get_pending_matches(self, player_id: str) -> List[MatchRecord]:
+        return self.match_store.get_pending(player_id)
+
+    def acknowledge_match(self, player_id: str, match_id: str) -> bool:
+        return self.match_store.acknowledge(player_id, match_id)
+
     def get_and_clear_matches(self) -> List[MatchRecord]:
+        """Legacy process-local match feed kept for backward compatibility."""
         out = self.created_matches
         self.created_matches = []
         return out
