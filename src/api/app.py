@@ -8,6 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from core.engine import MatchmakingEngine
+from core.match_store import RedisMatchStore
 from core.redis_queue import RedisMatchmakingQueue
 
 app = FastAPI(title="Matchmaking Service")
@@ -20,7 +21,8 @@ def build_engine() -> MatchmakingEngine:
 
     namespace = os.getenv("REDIS_NAMESPACE", "matchmaking")
     queue = RedisMatchmakingQueue.from_url(redis_url, namespace=namespace)
-    return MatchmakingEngine(queue=queue)
+    match_store = RedisMatchStore(queue.client, namespace=namespace)
+    return MatchmakingEngine(queue=queue, match_store=match_store)
 
 
 engine = build_engine()
@@ -45,6 +47,10 @@ class DequeueRequest(BaseModel):
 
 class TickRequest(BaseModel):
     timestamp_utc: Optional[str] = None
+
+
+class AcknowledgeMatchRequest(BaseModel):
+    match_id: str = Field(..., min_length=1)
 
 
 def parse_time(ts: Optional[str]) -> datetime:
@@ -134,8 +140,25 @@ async def tick(req: TickRequest):
     return {"ticked": True, "metrics": metrics}
 
 
+@app.get("/players/{player_id}/matches")
+async def player_matches(player_id: str):
+    async with lock:
+        pending = engine.get_pending_matches(player_id)
+    return {"player_id": player_id, "matches": [asdict(match) for match in pending]}
+
+
+@app.post("/players/{player_id}/matches/ack")
+async def acknowledge_player_match(player_id: str, req: AcknowledgeMatchRequest):
+    async with lock:
+        acknowledged = engine.acknowledge_match(player_id, req.match_id)
+    if not acknowledged:
+        raise HTTPException(status_code=404, detail="pending match not found for player")
+    return {"acknowledged": True, "player_id": player_id, "match_id": req.match_id}
+
+
 @app.get("/matches")
 async def matches():
+    """Legacy process-local feed. Prefer /players/{player_id}/matches."""
     async with lock:
         out = engine.get_and_clear_matches()
     return {"matches": [asdict(match) for match in out]}
