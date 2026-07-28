@@ -4,18 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matchmaking-service"
-version = "0.1.0"
+version = "0.2.0"
 description = "Skill-based matchmaking service"
 dependencies = [
   "fastapi",
   "uvicorn",
   "pydantic",
+  "redis>=5.0,<7.0",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest",
   "httpx",
+  "fakeredis>=2.23,<3.0",
 ]
 
 [tool.setuptools]
