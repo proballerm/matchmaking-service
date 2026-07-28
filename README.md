@@ -8,6 +8,7 @@ A skill-based matchmaking backend built with FastAPI. The service balances match
 - SLA-forced matches for players waiting beyond the configured maximum
 - Redis-backed queue persistence with automatic recovery after API restarts
 - Atomic Redis player claims that prevent duplicate matches across workers
+- Durable per-player match inboxes with explicit acknowledgement
 - In-memory fallback for local development and deterministic tests
 - Continuous background matchmaking loop
 - Docker and Docker Compose support
@@ -20,26 +21,25 @@ Clients
    |
 FastAPI instances / matchmaking workers
    |
-Shared Redis queue
+Shared Redis queue + durable player inboxes
    |
-Atomic Lua claim operation
+Atomic Lua player claims
 ```
 
-The engine is independent of FastAPI and accepts any queue backend matching the queue interface.
+The engine is independent of FastAPI and accepts queue and match-store backends through small interfaces.
 
-- `src/core/engine.py` — orchestration, worker-state synchronization, metrics, and match records
+- `src/core/engine.py` — orchestration, worker synchronization, match creation, and delivery
 - `src/core/matcher.py` — threshold matching, SLA enforcement, and atomic claim usage
 - `src/core/queue.py` — in-memory queue implementing the same claim contract
 - `src/core/redis_queue.py` — Redis sorted-set, rating hash, and Lua claim script
+- `src/core/match_store.py` — in-memory and Redis per-player match inboxes
 - `src/api/app.py` — HTTP API and background worker
 
-Redis stores player IDs in a sorted set scored by UTC join timestamp. Ratings are stored in a Redis hash. Each worker reads candidates independently, but a Redis Lua script verifies and removes both players as one indivisible operation. Only one worker can successfully claim a pair.
+Redis stores waiting players in a sorted set scored by UTC join timestamp. Ratings are stored in a hash. Workers identify candidate pairs independently, but a Lua script verifies and removes both players atomically so only one worker can successfully claim them.
 
-This supports multiple active matchmaking workers without assigning the same player to two matches.
+After a match is created, Redis stores the serialized result and appends its ID to a separate inbox for each participating player. A player keeps receiving the result until that player explicitly acknowledges it. One player's acknowledgement does not remove the result from the other player's inbox.
 
 ## Run with Redis
-
-The easiest setup uses Docker Compose:
 
 ```bash
 docker compose up --build
@@ -51,39 +51,29 @@ Then open:
 - Health endpoint: `http://localhost:8000/health`
 - Metrics: `http://localhost:8000/metrics`
 
-The health response reports whether the queue backend is `redis` or `memory`.
+Multiple processes can share the same Redis state:
+
+```bash
+REDIS_URL=redis://localhost:6379/0 uvicorn api.app:app --workers 4
+```
 
 ## Run without Redis
-
-Install dependencies and start the API without setting `REDIS_URL`:
 
 ```bash
 pip install -e ".[dev]"
 uvicorn api.app:app --reload
 ```
 
-The service will use the original in-memory queue.
+Without `REDIS_URL`, the service uses in-memory queue and match-store implementations.
 
 ## Configuration
 
 | Variable | Default | Description |
 |---|---|---|
 | `REDIS_URL` | unset | Redis connection URL. When unset, the service uses memory. |
-| `REDIS_NAMESPACE` | `matchmaking` | Prefix for Redis queue keys. |
+| `REDIS_NAMESPACE` | `matchmaking` | Prefix for Redis queue and match-delivery keys. |
 | `ENABLE_BACKGROUND_TICK` | `1` | Enables the background matchmaking loop. |
 | `TICK_INTERVAL_SECONDS` | `1.0` | Seconds between matchmaking ticks. |
-
-Example:
-
-```bash
-REDIS_URL=redis://localhost:6379/0 uvicorn api.app:app --reload
-```
-
-Multiple processes can share the same queue:
-
-```bash
-REDIS_URL=redis://localhost:6379/0 uvicorn api.app:app --workers 4
-```
 
 ## API
 
@@ -99,8 +89,6 @@ Content-Type: application/json
 }
 ```
 
-Duplicate queued player IDs return HTTP `409`.
-
 ### Dequeue a player
 
 ```http
@@ -112,11 +100,50 @@ Content-Type: application/json
 }
 ```
 
-### Poll matches
+### Poll a player's pending matches
+
+```http
+GET /players/p1/matches
+```
+
+Example response:
+
+```json
+{
+  "player_id": "p1",
+  "matches": [
+    {
+      "match_id": "example-match-id",
+      "player_ids": ["p1", "p2"],
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "rating_diff": 25.0,
+      "sla_forced": false,
+      "threshold_at_match": 100.0
+    }
+  ]
+}
+```
+
+### Acknowledge a delivered match
+
+```http
+POST /players/p1/matches/ack
+Content-Type: application/json
+
+{
+  "match_id": "example-match-id"
+}
+```
+
+Acknowledgement removes the match only from `p1`'s pending inbox. The other participant must acknowledge independently.
+
+### Legacy global match feed
 
 ```http
 GET /matches
 ```
+
+This endpoint is process-local and retained only for backward compatibility. New clients should use the player-specific endpoints.
 
 ### Trigger one matchmaking tick
 
@@ -133,38 +160,25 @@ Content-Type: application/json
 GET /metrics
 ```
 
-## Atomic claim behavior
-
-Workers first identify a candidate pair from the shared queue. They then call `claim_players`.
-
-The Redis implementation executes a Lua script that:
-
-1. Confirms every requested player is still queued.
-2. Removes all players from the sorted set.
-3. Removes their rating metadata.
-4. Returns success to exactly one worker.
-
-When another worker already claimed either player, the script returns failure without removing anyone else. The losing worker refreshes the queue and continues.
-
 ## Tests
 
 ```bash
 pytest -q
 ```
 
-Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The test suite includes a two-worker race that verifies each player can appear in at most one match.
+Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers atomic multi-worker claims, persistence across match-store recreation, player-scoped acknowledgements, and independent delivery to both participants.
 
 ## Current limitations
 
-- Match result delivery is still stored in the API process that created the match.
+- Queue claiming and match publication are separate Redis operations; a worker crash between them could claim players before publishing their result.
+- Match payloads are retained after both players acknowledge them; retention cleanup is not implemented yet.
 - Metrics counters are process-local and reset when an API instance restarts.
-- Durable match history and acknowledgement-based delivery are not yet implemented.
 - Adaptive threshold state is not yet shared across workers.
 
 ## Next improvements
 
-- Durable per-player match delivery and acknowledgement in Redis
-- Shared threshold and metrics state across workers
-- Prometheus metrics and Grafana dashboards
-- Load testing and matchmaking benchmark reports
-- Authentication and rate limiting
+- Combine player claim and match publication into one atomic Redis operation
+- Add match retention and cleanup after both acknowledgements
+- Share threshold and metrics state across workers
+- Add Prometheus metrics and Grafana dashboards
+- Add load testing and benchmark reports
