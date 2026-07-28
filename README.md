@@ -7,7 +7,7 @@ A skill-based matchmaking backend built with FastAPI. The service balances match
 - Skill-based matching with adaptive rating thresholds
 - SLA-forced matches for players waiting beyond the configured maximum
 - Redis-backed queue persistence with automatic recovery after API restarts
-- Atomic Redis player claims that prevent duplicate matches across workers
+- Atomic Redis match commits that prevent duplicate or lost matches across workers
 - Durable per-player match inboxes with explicit acknowledgement
 - In-memory fallback for local development and deterministic tests
 - Continuous background matchmaking loop
@@ -23,21 +23,28 @@ FastAPI instances / matchmaking workers
    |
 Shared Redis queue + durable player inboxes
    |
-Atomic Lua player claims
+Atomic Lua claim-and-publish operation
 ```
 
 The engine is independent of FastAPI and accepts queue and match-store backends through small interfaces.
 
 - `src/core/engine.py` — orchestration, worker synchronization, match creation, and delivery
-- `src/core/matcher.py` — threshold matching, SLA enforcement, and atomic claim usage
+- `src/core/matcher.py` — threshold matching and SLA candidate selection
 - `src/core/queue.py` — in-memory queue implementing the same claim contract
-- `src/core/redis_queue.py` — Redis sorted-set, rating hash, and Lua claim script
-- `src/core/match_store.py` — in-memory and Redis per-player match inboxes
+- `src/core/redis_queue.py` — Redis sorted-set and rating-hash queue
+- `src/core/match_store.py` — in-memory delivery plus atomic Redis claim-and-publish logic
 - `src/api/app.py` — HTTP API and background worker
 
-Redis stores waiting players in a sorted set scored by UTC join timestamp. Ratings are stored in a hash. Workers identify candidate pairs independently, but a Lua script verifies and removes both players atomically so only one worker can successfully claim them.
+Redis stores waiting players in a sorted set scored by UTC join timestamp and stores ratings in a hash. Workers identify candidate pairs independently. For each candidate, the engine builds the complete match record before attempting the commit.
 
-After a match is created, Redis stores the serialized result and appends its ID to a separate inbox for each participating player. A player keeps receiving the result until that player explicitly acknowledges it. One player's acknowledgement does not remove the result from the other player's inbox.
+A Redis Lua script then performs all of the following as one indivisible operation:
+
+1. Confirms both players are still queued.
+2. Removes both players and their rating metadata.
+3. Stores the serialized match record.
+4. Adds the match ID to each player's inbox.
+
+If either player was already claimed, the script returns failure and writes nothing. This removes the crash window where a worker could previously remove players and fail before publishing their match.
 
 ## Run with Redis
 
@@ -106,24 +113,6 @@ Content-Type: application/json
 GET /players/p1/matches
 ```
 
-Example response:
-
-```json
-{
-  "player_id": "p1",
-  "matches": [
-    {
-      "match_id": "example-match-id",
-      "player_ids": ["p1", "p2"],
-      "created_at": "2026-01-01T00:00:00+00:00",
-      "rating_diff": 25.0,
-      "sla_forced": false,
-      "threshold_at_match": 100.0
-    }
-  ]
-}
-```
-
 ### Acknowledge a delivered match
 
 ```http
@@ -135,7 +124,7 @@ Content-Type: application/json
 }
 ```
 
-Acknowledgement removes the match only from `p1`'s pending inbox. The other participant must acknowledge independently.
+Acknowledgement removes the match only from that player's pending inbox. The other participant acknowledges independently.
 
 ### Legacy global match feed
 
@@ -166,19 +155,18 @@ GET /metrics
 pytest -q
 ```
 
-Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers atomic multi-worker claims, persistence across match-store recreation, player-scoped acknowledgements, and independent delivery to both participants.
+Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers atomic multi-worker claims, all-or-nothing match commits, failed-claim rollback behavior, persistence, and player-scoped acknowledgements.
 
 ## Current limitations
 
-- Queue claiming and match publication are separate Redis operations; a worker crash between them could claim players before publishing their result.
 - Match payloads are retained after both players acknowledge them; retention cleanup is not implemented yet.
 - Metrics counters are process-local and reset when an API instance restarts.
 - Adaptive threshold state is not yet shared across workers.
 
 ## Next improvements
 
-- Combine player claim and match publication into one atomic Redis operation
 - Add match retention and cleanup after both acknowledgements
 - Share threshold and metrics state across workers
 - Add Prometheus metrics and Grafana dashboards
 - Add load testing and benchmark reports
+- Add authentication and rate limiting
