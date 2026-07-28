@@ -10,8 +10,26 @@ from redis import Redis
 from core.models import MatchRecord
 
 
+ATOMIC_CLAIM_AND_PUBLISH_SCRIPT = """
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) == false then
+    return 0
+end
+if redis.call('ZSCORE', KEYS[1], ARGV[2]) == false then
+    return 0
+end
+
+redis.call('ZREM', KEYS[1], ARGV[1], ARGV[2])
+redis.call('HDEL', KEYS[2], ARGV[1], ARGV[2])
+redis.call('HSET', KEYS[3], ARGV[3], ARGV[4])
+redis.call('RPUSH', KEYS[4], ARGV[3])
+redis.call('RPUSH', KEYS[5], ARGV[3])
+return 1
+"""
+
+
 class MatchStore(Protocol):
     def publish(self, match: MatchRecord) -> None: ...
+    def claim_and_publish(self, queue: object, match: MatchRecord) -> bool: ...
     def get_pending(self, player_id: str) -> List[MatchRecord]: ...
     def acknowledge(self, player_id: str, match_id: str) -> bool: ...
 
@@ -44,6 +62,13 @@ class InMemoryMatchStore:
         self._matches[match.match_id] = match
         for player_id in match.player_ids:
             self._inboxes.setdefault(player_id, []).append(match.match_id)
+
+    def claim_and_publish(self, queue: object, match: MatchRecord) -> bool:
+        claim_players = getattr(queue, "claim_players")
+        if not claim_players(match.player_ids):
+            return False
+        self.publish(match)
+        return True
 
     def get_pending(self, player_id: str) -> List[MatchRecord]:
         return [
@@ -78,6 +103,33 @@ class RedisMatchStore:
             for player_id in match.player_ids:
                 pipe.rpush(self._inbox_key(player_id), match.match_id)
             pipe.execute()
+
+    def claim_and_publish(self, queue: object, match: MatchRecord) -> bool:
+        """Atomically claim a pair and publish the result to both inboxes."""
+        if len(match.player_ids) != 2:
+            raise ValueError("atomic delivery currently requires exactly two players")
+
+        queue_client = getattr(queue, "client", None)
+        queue_key = getattr(queue, "queue_key", None)
+        ratings_key = getattr(queue, "ratings_key", None)
+        if queue_client is not self.client or not queue_key or not ratings_key:
+            raise ValueError("Redis queue and match store must share the same client")
+
+        player_a, player_b = match.player_ids
+        result = self.client.eval(
+            ATOMIC_CLAIM_AND_PUBLISH_SCRIPT,
+            5,
+            queue_key,
+            ratings_key,
+            self.matches_key,
+            self._inbox_key(player_a),
+            self._inbox_key(player_b),
+            player_a,
+            player_b,
+            match.match_id,
+            _serialize(match),
+        )
+        return bool(result)
 
     def get_pending(self, player_id: str) -> List[MatchRecord]:
         match_ids = self.client.lrange(self._inbox_key(player_id), 0, -1)
