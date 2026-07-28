@@ -43,7 +43,6 @@ class MatchmakingEngine:
         self.sla_forced_matches = 0
 
     def _sync_waiting_players(self) -> None:
-        """Refresh this worker's local view from the shared queue backend."""
         entries = self.queue.get_entries()
         self.players = {
             entry.player_id: Player(entry.player_id, entry.rating, entry.join_time)
@@ -60,7 +59,6 @@ class MatchmakingEngine:
         now: Optional[datetime] = None,
     ) -> bool:
         now = now or self._now_fn()
-
         try:
             self.queue.add_player(player_id, rating, now)
         except ValueError:
@@ -85,6 +83,7 @@ class MatchmakingEngine:
         now = now or self._now_fn()
         self._sync_waiting_players()
         new_records: List[MatchRecord] = []
+        normal_waits: List[float] = []
 
         def claim_normal(player_ids: List[str], rating_diff: float) -> bool:
             record = self._build_match_record(
@@ -95,6 +94,12 @@ class MatchmakingEngine:
             )
             if not self.match_store.claim_and_publish(self.queue, record):
                 return False
+
+            for player_id in player_ids:
+                joined_at = self.join_times.get(player_id)
+                if joined_at is not None:
+                    normal_waits.append((now - joined_at).total_seconds())
+
             new_records.append(record)
             self._remove_local_players(player_ids)
             return True
@@ -104,16 +109,8 @@ class MatchmakingEngine:
             claim_match=claim_normal,
         )
 
-        if normal_matches:
-            waits: List[float] = []
-            for match in normal_matches:
-                for player_id in match.player_ids:
-                    joined_at = self.join_times.get(player_id)
-                    if joined_at is not None:
-                        waits.append((now - joined_at).total_seconds())
-
-            if waits:
-                self.matchmaker.adapt_threshold(sum(waits) / len(waits))
+        if normal_matches and normal_waits:
+            self.matchmaker.adapt_threshold(sum(normal_waits) / len(normal_waits))
 
         def claim_sla(player_ids: List[str], rating_diff: float) -> bool:
             record = self._build_match_record(
@@ -146,7 +143,6 @@ class MatchmakingEngine:
         return self.match_store.acknowledge(player_id, match_id)
 
     def get_and_clear_matches(self) -> List[MatchRecord]:
-        """Legacy process-local match feed kept for backward compatibility."""
         out = self.created_matches
         self.created_matches = []
         return out
@@ -154,7 +150,6 @@ class MatchmakingEngine:
     def get_metrics(self) -> Dict[str, float]:
         queue_depth = self.queue.size()
         sla_pct = (self.sla_forced_matches / self.total_matches) * 100 if self.total_matches else 0.0
-
         return {
             "queue_depth": float(queue_depth),
             "total_enqueues": float(self.total_enqueues),
