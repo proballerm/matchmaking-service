@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from api.observability import install_observability
 from core.engine import MatchmakingEngine
 from core.match_store import RedisMatchStore
 from core.redis_queue import RedisMatchmakingQueue
@@ -32,6 +33,7 @@ def build_engine() -> MatchmakingEngine:
 
 
 engine = build_engine()
+install_observability(app, engine.get_metrics)
 
 TICK_INTERVAL_SECONDS = float(os.getenv("TICK_INTERVAL_SECONDS", "1.0"))
 ENABLE_BACKGROUND_TICK = os.getenv("ENABLE_BACKGROUND_TICK", "1") == "1"
@@ -109,6 +111,7 @@ async def root():
         "service": "matchmaking",
         "docs": "/docs",
         "health": "/health",
+        "prometheus": "/prometheus",
         "queue_backend": "redis" if os.getenv("REDIS_URL") else "memory",
     }
 
