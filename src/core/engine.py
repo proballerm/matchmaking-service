@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 from uuid import uuid4
 
 from core.matcher import Matchmaker
@@ -12,7 +12,8 @@ from core.queue import MatchmakingQueue
 
 class QueueBackend(Protocol):
     def add_player(self, player_id: str, rating: float, join_time: datetime) -> None: ...
-    def remove_players(self, player_ids: List[str]) -> None: ...
+    def remove_players(self, player_ids: Iterable[str]) -> None: ...
+    def claim_players(self, player_ids: Iterable[str]) -> bool: ...
     def get_entries(self) -> List[QueueEntry]: ...
     def size(self) -> int: ...
 
@@ -40,19 +41,25 @@ class MatchmakingEngine:
         self.matchmaker = matchmaker or Matchmaker()
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
-        existing_entries = self.queue.get_entries()
-        self.players: Dict[str, Player] = {
-            entry.player_id: Player(entry.player_id, entry.rating, entry.join_time)
-            for entry in existing_entries
-        }
-        self.join_times: Dict[str, datetime] = {
-            entry.player_id: entry.join_time for entry in existing_entries
-        }
+        self.players: Dict[str, Player] = {}
+        self.join_times: Dict[str, datetime] = {}
+        self._sync_waiting_players()
         self.created_matches: List[MatchRecord] = []
 
         self.total_enqueues = 0
         self.total_matches = 0
         self.sla_forced_matches = 0
+
+    def _sync_waiting_players(self) -> None:
+        """Refresh this worker's local view from the shared queue backend."""
+        entries = self.queue.get_entries()
+        self.players = {
+            entry.player_id: Player(entry.player_id, entry.rating, entry.join_time)
+            for entry in entries
+        }
+        self.join_times = {
+            entry.player_id: entry.join_time for entry in entries
+        }
 
     def enqueue_player(
         self,
@@ -61,9 +68,6 @@ class MatchmakingEngine:
         now: Optional[datetime] = None,
     ) -> bool:
         now = now or self._now_fn()
-
-        if player_id in self.join_times:
-            return False
 
         try:
             self.queue.add_player(player_id, rating, now)
@@ -76,6 +80,7 @@ class MatchmakingEngine:
         return True
 
     def dequeue_player(self, player_id: str) -> bool:
+        self._sync_waiting_players()
         if player_id not in self.join_times:
             return False
 
@@ -86,6 +91,7 @@ class MatchmakingEngine:
 
     def run_matchmaking_once(self, now: Optional[datetime] = None) -> List[MatchRecord]:
         now = now or self._now_fn()
+        self._sync_waiting_players()
         new_records: List[MatchRecord] = []
 
         normal_matches = self.matchmaker.try_form_matches(self.queue)
@@ -133,20 +139,20 @@ class MatchmakingEngine:
         }
 
     def _record_match(self, match: Match, now: datetime, sla_forced: bool) -> MatchRecord:
-        p1_id, p2_id = match.player_ids
-        p1 = self.players[p1_id]
-        p2 = self.players[p2_id]
+        player_a_id, player_b_id = match.player_ids
+        player_a = self.players[player_a_id]
+        player_b = self.players[player_b_id]
 
         record = MatchRecord(
             match_id=str(uuid4()),
-            player_ids=(p1_id, p2_id),
+            player_ids=(player_a_id, player_b_id),
             created_at=now,
-            rating_diff=abs(p1.rating - p2.rating),
+            rating_diff=abs(player_a.rating - player_b.rating),
             sla_forced=sla_forced,
             threshold_at_match=float(self.matchmaker.current_threshold),
         )
-        self.players.pop(p1_id, None)
-        self.players.pop(p2_id, None)
-        self.join_times.pop(p1_id, None)
-        self.join_times.pop(p2_id, None)
+        self.players.pop(player_a_id, None)
+        self.players.pop(player_b_id, None)
+        self.join_times.pop(player_a_id, None)
+        self.join_times.pop(player_b_id, None)
         return record
