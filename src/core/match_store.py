@@ -3,11 +3,11 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from datetime import datetime
-from typing import Dict, Iterable, List, Protocol
+from typing import Dict, List, Protocol
 
 from redis import Redis
 
-from core.engine import MatchRecord
+from core.models import MatchRecord
 
 
 class MatchStore(Protocol):
