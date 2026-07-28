@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Protocol
 
-from core.models import Match
-from core.queue import MatchmakingQueue
+from core.models import Match, QueueEntry
+
+
+class ClaimableQueue(Protocol):
+    def get_entries(self) -> List[QueueEntry]: ...
+    def claim_players(self, player_ids: List[str]) -> bool: ...
 
 
 class Matchmaker:
-    """
-    Matchmaker with adaptive rating threshold and SLA enforcement.
-    """
+    """Matchmaker with adaptive rating thresholds and SLA enforcement."""
 
     def __init__(
         self,
@@ -32,45 +34,39 @@ class Matchmaker:
     def adapt_threshold(self, avg_wait_time: float) -> None:
         error = avg_wait_time - self.target_avg_wait
         self.current_threshold += self.adapt_rate * error
-
         self.current_threshold = max(
             self.min_threshold,
             min(self.max_threshold, self.current_threshold),
         )
 
-    def try_form_matches(self, queue: MatchmakingQueue) -> List[Match]:
-        entries = sorted(queue.get_entries(), key=lambda e: e.join_time)
+    def try_form_matches(self, queue: ClaimableQueue) -> List[Match]:
+        entries = sorted(queue.get_entries(), key=lambda entry: entry.join_time)
         matches: List[Match] = []
-        used_players = set()
+        unavailable_players = set()
 
-        for i in range(len(entries)):
-            a = entries[i]
-            if a.player_id in used_players:
+        for index, player_a in enumerate(entries):
+            if player_a.player_id in unavailable_players:
                 continue
 
-            for j in range(i + 1, len(entries)):
-                b = entries[j]
-                if b.player_id in used_players:
+            for player_b in entries[index + 1 :]:
+                if player_b.player_id in unavailable_players:
+                    continue
+                if abs(player_a.rating - player_b.rating) > self.current_threshold:
                     continue
 
-                if abs(a.rating - b.rating) <= self.current_threshold:
-                    matches.append(Match.create([a.player_id, b.player_id]))
-                    used_players.add(a.player_id)
-                    used_players.add(b.player_id)
+                player_ids = [player_a.player_id, player_b.player_id]
+                if queue.claim_players(player_ids):
+                    matches.append(Match.create(player_ids))
+                    unavailable_players.update(player_ids)
                     break
 
-        if matches:
-            matched_ids = [pid for m in matches for pid in m.player_ids]
-            queue.remove_players(matched_ids)
+                # Another worker claimed at least one member of this pair.
+                unavailable_players.update(player_ids)
+                break
 
         return matches
 
-    def enforce_sla(self, queue: MatchmakingQueue, now: datetime) -> List[Match]:
-        """
-        Force matches for players who exceeded max wait time.
-        SLA matches do not depend on current_threshold.
-        """
-        # Normalize now to timezone-aware UTC (defensive)
+    def enforce_sla(self, queue: ClaimableQueue, now: datetime) -> List[Match]:
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         else:
@@ -78,22 +74,30 @@ class Matchmaker:
 
         matches: List[Match] = []
 
-        # Work off a local view of entries and update it after removals.
-        entries = sorted(queue.get_entries(), key=lambda e: e.join_time)
-
-        while len(entries) >= 2:
-            oldest = entries[0]
-            wait_time = (now - oldest.join_time).total_seconds()
-
-            if wait_time < self.max_wait_time:
+        while True:
+            entries = sorted(queue.get_entries(), key=lambda entry: entry.join_time)
+            if len(entries) < 2:
                 break
 
-            partner = min(entries[1:], key=lambda e: abs(e.rating - oldest.rating))
-            matches.append(Match.create([oldest.player_id, partner.player_id]))
+            oldest = entries[0]
+            if (now - oldest.join_time).total_seconds() < self.max_wait_time:
+                break
 
-            queue.remove_players([oldest.player_id, partner.player_id])
+            partners = sorted(
+                entries[1:],
+                key=lambda entry: abs(entry.rating - oldest.rating),
+            )
 
-            # Refresh entries after removal
-            entries = sorted(queue.get_entries(), key=lambda e: e.join_time)
+            claimed = False
+            for partner in partners:
+                player_ids = [oldest.player_id, partner.player_id]
+                if queue.claim_players(player_ids):
+                    matches.append(Match.create(player_ids))
+                    claimed = True
+                    break
+
+            if not claimed:
+                # The queue changed under this worker. Refresh before deciding.
+                continue
 
         return matches
