@@ -1,0 +1,29 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      REDIS_NAMESPACE: matchmaking
+      ENABLE_BACKGROUND_TICK: "1"
+      TICK_INTERVAL_SECONDS: "1.0"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:
