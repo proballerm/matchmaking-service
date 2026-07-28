@@ -8,10 +8,22 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from core.engine import MatchmakingEngine
+from core.redis_queue import RedisMatchmakingQueue
 
 app = FastAPI(title="Matchmaking Service")
 
-engine = MatchmakingEngine()
+
+def build_engine() -> MatchmakingEngine:
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        return MatchmakingEngine()
+
+    namespace = os.getenv("REDIS_NAMESPACE", "matchmaking")
+    queue = RedisMatchmakingQueue.from_url(redis_url, namespace=namespace)
+    return MatchmakingEngine(queue=queue)
+
+
+engine = build_engine()
 
 TICK_INTERVAL_SECONDS = float(os.getenv("TICK_INTERVAL_SECONDS", "1.0"))
 ENABLE_BACKGROUND_TICK = os.getenv("ENABLE_BACKGROUND_TICK", "1") == "1"
@@ -36,11 +48,6 @@ class TickRequest(BaseModel):
 
 
 def parse_time(ts: Optional[str]) -> datetime:
-    """
-    Parse ISO timestamps, always returning timezone-aware UTC.
-    If input is missing, uses current UTC time.
-    If input is naive, assumes UTC.
-    """
     if not ts:
         return datetime.now(timezone.utc)
 
@@ -59,8 +66,8 @@ async def tick_loop() -> None:
         try:
             async with lock:
                 engine.run_matchmaking_once(utcnow())
-        except Exception as e:
-            print(f"[tick_loop] error: {e}")
+        except Exception as exc:
+            print(f"[tick_loop] error: {exc}")
         await asyncio.sleep(TICK_INTERVAL_SECONDS)
 
 
@@ -86,12 +93,17 @@ async def on_shutdown() -> None:
 
 @app.get("/")
 async def root():
-    return {"service": "matchmaking", "docs": "/docs", "health": "/health"}
+    return {
+        "service": "matchmaking",
+        "docs": "/docs",
+        "health": "/health",
+        "queue_backend": "redis" if os.getenv("REDIS_URL") else "memory",
+    }
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "queue_backend": "redis" if os.getenv("REDIS_URL") else "memory"}
 
 
 @app.post("/enqueue")
@@ -115,21 +127,18 @@ async def dequeue(req: DequeueRequest):
 
 @app.post("/tick")
 async def tick(req: TickRequest):
-    """
-    Debug only endpoint. Background tick should be enabled in normal operation.
-    """
     t = parse_time(req.timestamp_utc)
     async with lock:
         engine.run_matchmaking_once(t)
-        m = engine.get_metrics()
-    return {"ticked": True, "metrics": m}
+        metrics = engine.get_metrics()
+    return {"ticked": True, "metrics": metrics}
 
 
 @app.get("/matches")
 async def matches():
     async with lock:
         out = engine.get_and_clear_matches()
-    return {"matches": [asdict(m) for m in out]}
+    return {"matches": [asdict(match) for match in out]}
 
 
 @app.get("/metrics")
