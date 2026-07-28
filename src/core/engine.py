@@ -40,8 +40,14 @@ class MatchmakingEngine:
         self.matchmaker = matchmaker or Matchmaker()
         self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
 
-        self.players: Dict[str, Player] = {}
-        self.join_times: Dict[str, datetime] = {}
+        existing_entries = self.queue.get_entries()
+        self.players: Dict[str, Player] = {
+            entry.player_id: Player(entry.player_id, entry.rating, entry.join_time)
+            for entry in existing_entries
+        }
+        self.join_times: Dict[str, datetime] = {
+            entry.player_id: entry.join_time for entry in existing_entries
+        }
         self.created_matches: List[MatchRecord] = []
 
         self.total_enqueues = 0
@@ -131,7 +137,7 @@ class MatchmakingEngine:
         p1 = self.players[p1_id]
         p2 = self.players[p2_id]
 
-        return MatchRecord(
+        record = MatchRecord(
             match_id=str(uuid4()),
             player_ids=(p1_id, p2_id),
             created_at=now,
@@ -139,3 +145,8 @@ class MatchmakingEngine:
             sla_forced=sla_forced,
             threshold_at_match=float(self.matchmaker.current_threshold),
         )
+        self.players.pop(p1_id, None)
+        self.players.pop(p2_id, None)
+        self.join_times.pop(p1_id, None)
+        self.join_times.pop(p2_id, None)
+        return record
