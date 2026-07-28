@@ -9,6 +9,7 @@ A skill-based matchmaking backend built with FastAPI. The service balances match
 - Redis-backed queue persistence with automatic recovery after API restarts
 - Atomic Redis match commits that prevent duplicate or lost matches across workers
 - Durable per-player match inboxes with explicit acknowledgement
+- Automatic match payload cleanup after all participants acknowledge delivery
 - In-memory fallback for local development and deterministic tests
 - Continuous background matchmaking loop
 - Docker and Docker Compose support
@@ -23,7 +24,7 @@ FastAPI instances / matchmaking workers
    |
 Shared Redis queue + durable player inboxes
    |
-Atomic Lua claim-and-publish operation
+Atomic Lua claim, publish, acknowledge, and cleanup operations
 ```
 
 The engine is independent of FastAPI and accepts queue and match-store backends through small interfaces.
@@ -32,7 +33,7 @@ The engine is independent of FastAPI and accepts queue and match-store backends 
 - `src/core/matcher.py` — threshold matching and SLA candidate selection
 - `src/core/queue.py` — in-memory queue implementing the same claim contract
 - `src/core/redis_queue.py` — Redis sorted-set and rating-hash queue
-- `src/core/match_store.py` — in-memory delivery plus atomic Redis claim-and-publish logic
+- `src/core/match_store.py` — in-memory delivery plus atomic Redis publication and cleanup
 - `src/api/app.py` — HTTP API and background worker
 
 Redis stores waiting players in a sorted set scored by UTC join timestamp and stores ratings in a hash. Workers identify candidate pairs independently. For each candidate, the engine builds the complete match record before attempting the commit.
@@ -42,9 +43,12 @@ A Redis Lua script then performs all of the following as one indivisible operati
 1. Confirms both players are still queued.
 2. Removes both players and their rating metadata.
 3. Stores the serialized match record.
-4. Adds the match ID to each player's inbox.
+4. Stores the number of required acknowledgements.
+5. Adds the match ID to each player's inbox.
 
-If either player was already claimed, the script returns failure and writes nothing. This removes the crash window where a worker could previously remove players and fail before publishing their match.
+If either player was already claimed, the script returns failure and writes nothing. This removes the crash window where a worker could remove players and fail before publishing their match.
+
+Acknowledgements are also processed atomically. Redis removes the match only from the acknowledging player's inbox and decrements the remaining acknowledgement count. When the final participant acknowledges, Redis deletes both the stored match payload and its acknowledgement counter. Duplicate or invalid acknowledgements do not decrement the count.
 
 ## Run with Redis
 
@@ -124,7 +128,7 @@ Content-Type: application/json
 }
 ```
 
-Acknowledgement removes the match only from that player's pending inbox. The other participant acknowledges independently.
+Acknowledgement removes the match only from that player's pending inbox. The other participant acknowledges independently. After the final acknowledgement, the shared match payload is deleted automatically.
 
 ### Legacy global match feed
 
@@ -155,18 +159,18 @@ GET /metrics
 pytest -q
 ```
 
-Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers atomic multi-worker claims, all-or-nothing match commits, failed-claim rollback behavior, persistence, and player-scoped acknowledgements.
+Redis tests use `fakeredis[lua]`, so a running Redis server is not required. The suite covers atomic multi-worker claims, all-or-nothing match commits, failed-claim rollback behavior, persistence, player-scoped acknowledgements, duplicate acknowledgements, and automatic cleanup after final delivery.
 
 ## Current limitations
 
-- Match payloads are retained after both players acknowledge them; retention cleanup is not implemented yet.
 - Metrics counters are process-local and reset when an API instance restarts.
 - Adaptive threshold state is not yet shared across workers.
+- Match records are removed after delivery, so long-term match history requires a separate durable database.
 
 ## Next improvements
 
-- Add match retention and cleanup after both acknowledgements
 - Share threshold and metrics state across workers
 - Add Prometheus metrics and Grafana dashboards
 - Add load testing and benchmark reports
 - Add authentication and rate limiting
+- Add PostgreSQL-backed long-term match history
