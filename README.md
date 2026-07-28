@@ -1,5 +1,7 @@
 # Matchmaking Service
 
+[![CI](https://github.com/proballerm/matchmaking-service/actions/workflows/ci.yml/badge.svg)](https://github.com/proballerm/matchmaking-service/actions/workflows/ci.yml)
+
 A skill-based matchmaking backend built with FastAPI. The service balances match fairness and queue latency with an adaptive rating threshold while enforcing a hard maximum-wait SLA.
 
 ## Features
@@ -13,6 +15,7 @@ A skill-based matchmaking backend built with FastAPI. The service balances match
 - Shared Redis-backed threshold and system-wide counters
 - Prometheus instrumentation and a provisioned Grafana dashboard
 - Reproducible Locust load tests with CSV, HTML, and JSON results
+- GitHub Actions CI across Python 3.11 and 3.12
 - In-memory backends for local development and deterministic tests
 
 ## Architecture
@@ -41,6 +44,7 @@ Key files:
 - `loadtest/run_benchmark.sh` — reproducible headless benchmark runner
 - `loadtest/summarize_results.py` — normalized JSON result generator
 - `benchmark/REPORT.md` — evidence-based benchmark report template
+- `.github/workflows/ci.yml` — automated tests and benchmark smoke checks
 
 ## Run the full stack
 
@@ -64,6 +68,21 @@ password: admin
 ```
 
 The **Matchmaking Service Overview** dashboard is provisioned automatically. It includes queue depth, rating threshold, total matches, SLA-forced percentage, match rate, API p95 latency, request rate, and 5xx error rate.
+
+## Continuous integration
+
+The `CI` workflow runs on pushes to `main`, pull requests, and manual dispatches.
+
+It performs:
+
+1. Full `pytest` runs on Python 3.11 and 3.12.
+2. Docker Compose configuration validation.
+3. A Redis-backed API startup and health check.
+4. A 10-user, 15-second Locust benchmark smoke test.
+5. CSV-to-JSON benchmark summarization.
+6. Upload of benchmark CSV, HTML, JSON, and API logs for 14 days.
+
+The benchmark job runs only after both Python test jobs pass. Concurrent runs for the same branch are cancelled so outdated commits do not consume CI time.
 
 ## Run a benchmark
 
@@ -190,4 +209,3 @@ The suite covers multi-worker atomicity, durable delivery, shared threshold stat
 - Add PostgreSQL-backed long-term match history
 - Add alerting rules for queue growth, latency, and SLA degradation
 - Add authentication and rate limiting
-- Add GitHub Actions CI for tests and benchmark smoke checks
