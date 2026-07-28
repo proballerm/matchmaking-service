@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "matchmaking-service"
-version = "0.6.0"
+version = "0.7.0"
 description = "Skill-based matchmaking service"
 dependencies = [
   "fastapi",
