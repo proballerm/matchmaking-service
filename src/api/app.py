@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from core.engine import MatchmakingEngine
 from core.match_store import RedisMatchStore
 from core.redis_queue import RedisMatchmakingQueue
+from core.state_store import RedisStateStore
 
 app = FastAPI(title="Matchmaking Service")
 
@@ -22,7 +23,12 @@ def build_engine() -> MatchmakingEngine:
     namespace = os.getenv("REDIS_NAMESPACE", "matchmaking")
     queue = RedisMatchmakingQueue.from_url(redis_url, namespace=namespace)
     match_store = RedisMatchStore(queue.client, namespace=namespace)
-    return MatchmakingEngine(queue=queue, match_store=match_store)
+    state_store = RedisStateStore(queue.client, namespace=namespace)
+    return MatchmakingEngine(
+        queue=queue,
+        match_store=match_store,
+        state_store=state_store,
+    )
 
 
 engine = build_engine()
