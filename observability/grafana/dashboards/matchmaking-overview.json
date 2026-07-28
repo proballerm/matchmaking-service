@@ -1,0 +1,97 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Queue Depth",
+      "id": 1,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "matchmaking_queue_depth", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Current Rating Threshold",
+      "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [{"expr": "matchmaking_current_threshold", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "Total Matches",
+      "id": 3,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "matchmaking_total_matches", "refId": "A"}]
+    },
+    {
+      "type": "stat",
+      "title": "SLA-Forced Percentage",
+      "id": 4,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []},
+      "targets": [{"expr": "matchmaking_sla_forced_percentage", "refId": "A"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue Depth and Threshold",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [
+        {"expr": "matchmaking_queue_depth", "legendFormat": "queue depth", "refId": "A"},
+        {"expr": "matchmaking_current_threshold", "legendFormat": "threshold", "refId": "B"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Match Creation Rate",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {"expr": "rate(matchmaking_total_matches[1m])", "legendFormat": "matches/sec", "refId": "A"},
+        {"expr": "rate(matchmaking_sla_forced_matches[1m])", "legendFormat": "sla matches/sec", "refId": "B"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "API p95 Latency",
+      "id": 7,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, route) (rate(matchmaking_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{route}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "API Request and Error Rate",
+      "id": 8,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "targets": [
+        {
+          "expr": "sum(rate(matchmaking_http_requests_total[1m]))",
+          "legendFormat": "requests/sec",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(matchmaking_http_requests_total{status=~\"5..\"}[1m]))",
+          "legendFormat": "5xx/sec",
+          "refId": "B"
+        }
+      ]
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["matchmaking", "redis", "fastapi"],
+  "templating": {"list": []},
+  "time": {"from": "now-30m", "to": "now"},
+  "timezone": "browser",
+  "title": "Matchmaking Service Overview",
+  "uid": "matchmaking-overview",
+  "version": 1
+}
